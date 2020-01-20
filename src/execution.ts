@@ -28,11 +28,12 @@ import {
   Kind,
   TypeNameMetaFieldDef
 } from "graphql";
+import { ExecutionContext as GraphQLContext } from "graphql/execution/execute";
 import {
-  collectFields,
-  ExecutionContext as GraphQLContext
-} from "graphql/execution/execute";
-import { FieldNode, OperationDefinitionNode } from "graphql/language/ast";
+  FieldNode,
+  OperationDefinitionNode,
+  DirectiveNode
+} from "graphql/language/ast";
 import Maybe from "graphql/tsutils/Maybe";
 import { GraphQLTypeResolver } from "graphql/type/definition";
 import {
@@ -43,7 +44,9 @@ import {
   flattenPath,
   getArgumentDefs,
   ObjectPath,
-  resolveFieldDef
+  resolveFieldDef,
+  JitFieldNode,
+  collectFields
 } from "./ast";
 import { GraphQLError as GraphqlJitError } from "./error";
 import createInspect from "./inspect";
@@ -78,6 +81,8 @@ export interface CompilerOptions {
 
   resolverInfoEnricher?: (inp: ResolveInfoEnricherInput) => object;
 }
+
+type Writeable<T> = { -readonly [P in keyof T]: T[P] };
 
 /**
  * The context used during compilation.
@@ -375,7 +380,6 @@ function compileOperation(context: CompilationContext) {
     context,
     type,
     context.operation.selectionSet,
-    Object.create(null),
     Object.create(null)
   );
   const topLevel = compileObjectType(
@@ -384,7 +388,7 @@ function compileOperation(context: CompilationContext) {
     [],
     [GLOBAL_ROOT_NAME],
     [GLOBAL_DATA_NAME],
-    undefined,
+    addPath(undefined, ""),
     GLOBAL_ERRORS_NAME,
     fieldMap,
     true
@@ -531,7 +535,10 @@ function compileDeferredField(
       if (${isPromiseInliner("__value")}) {
       ${promiseStarted()}
        __value.then(result => {
-        ${resolverHandler}(${GLOBAL_EXECUTION_CONTEXT}, ${resultParentPath}, result, ${parentIndexes});
+        // if the field was skipped, do not call resolver
+        if (Object.prototype.hasOwnProperty.call(${resultParentPath}, "${fieldName}")) {
+          ${resolverHandler}(${GLOBAL_EXECUTION_CONTEXT}, ${resultParentPath}, result, ${parentIndexes});
+        }
         ${promiseDone()}
        }, err => {
         if (err) {
@@ -541,7 +548,8 @@ function compileDeferredField(
         }
         ${promiseDone()}
        });
-      } else {
+      } else if (Object.prototype.hasOwnProperty.call(${resultParentPath}, "${fieldName}")) {
+        // if the field was skipped, do not call resolver
         ${resolverHandler}(${GLOBAL_EXECUTION_CONTEXT}, ${resultParentPath}, __value, ${parentIndexes});
       }
     }`;
@@ -745,7 +753,7 @@ function compileObjectType(
   destinationPaths: string[],
   responsePath: ObjectPath | undefined,
   errorDestination: string,
-  fieldMap: { [key: string]: FieldNode[] },
+  fieldMap: { [key: string]: JitFieldNode[] },
   alwaysDefer: boolean
 ): string {
   let body = "(";
@@ -776,50 +784,39 @@ function compileObjectType(
       continue;
     }
 
-    let compiledSkipDirective;
-    let compiledIncludeDirective;
-
-    if (responsePath != null) {
-      compiledSkipDirective = compileQueryDirective(
-        context,
-        "skip",
-        `skip${name}`,
-        fieldNodes[0],
-        type,
-        responsePath
-      );
-      compiledIncludeDirective = compileQueryDirective(
-        context,
-        "include",
-        `include${name}`,
-        fieldNodes[0],
-        type,
-        responsePath
-      );
-    }
-
     const isSkippedName = getIsSkippedName(name);
 
     iifeBody += `
       var ${isSkippedName} = false;
     `;
-    if (compiledIncludeDirective != null) {
-      iifeBody += `
-        ${compiledIncludeDirective.body}
-        if (${compiledIncludeDirective.argsName}.if === true) {
-          ${isSkippedName} = false
-        }
-      `;
-    }
 
-    // "skip" overrides "include"
-    if (compiledSkipDirective != null) {
-      iifeBody += `
-        ${compiledSkipDirective.body}
-        if (${compiledSkipDirective.argsName}.if === true) {
-          ${isSkippedName} = true
+    if (responsePath != null) {
+      for (const fieldNode of fieldNodes) {
+        if (fieldNode.fragmentDirectives != null) {
+          for (const directives of fieldNode.fragmentDirectives) {
+            iifeBody += compileSkipIncludeDirectives(
+              context,
+              directives,
+              name,
+              isSkippedName,
+              fieldNode,
+              type,
+              responsePath
+            );
+          }
         }
-      `;
+        if (fieldNode.directives != null) {
+          iifeBody += compileSkipIncludeDirectives(
+            context,
+            fieldNode.directives as Writeable<DirectiveNode[]>,
+            name,
+            isSkippedName,
+            fieldNode,
+            type,
+            responsePath
+          );
+        }
+      }
     }
 
     // Name is the field name or an alias supplied by the user
@@ -1214,31 +1211,85 @@ function objectPath(topLevel: string, path: ObjectPath) {
   return objectPath;
 }
 
+function compileSkipIncludeDirectives(
+  context: CompilationContext,
+  directiveNodes: DirectiveNode[],
+  fieldName: string,
+  isSkippedName: string,
+  fieldNode: FieldNode,
+  returnType: GraphQLOutputType,
+  responsePath: ObjectPath
+): string {
+  let body = "";
+
+  const compiledDirectives: {
+    name: string;
+    argsName: string;
+    body: string;
+  }[] = [];
+
+  for (const directive of directiveNodes) {
+    if (directive.name.value === "skip" || directive.name.value === "include") {
+      const compiledDirective = compileQueryDirective(
+        context,
+        directive,
+        `${directive.name.value}${fieldName}`,
+        fieldNode,
+        returnType,
+        responsePath
+      );
+      if (compiledDirective) {
+        compiledDirectives.push(compiledDirective);
+      }
+    }
+  }
+
+  /**
+   * Skip has higher priority than include.
+   * So we push it to the end
+   */
+  const sortedDirectives = compiledDirectives.sort((a, b) => {
+    if (a.name === b.name) return 0;
+    if (a.name === "skip") return 1;
+    if (b.name === "include") return -1;
+    return 0;
+  });
+
+  for (const compiledDirective of sortedDirectives) {
+    body += `${compiledDirective.body}`;
+
+    if (compiledDirective.name === "skip") {
+      body += `
+        if (${compiledDirective.argsName}.if === true) {
+          ${isSkippedName} = true;
+        }
+      `;
+    } else if (compiledDirective.name === "include") {
+      body += `
+        if (${compiledDirective.argsName}.if === false) {
+          ${isSkippedName} = true;
+        }
+      `;
+    }
+  }
+
+  return body;
+}
+
 function compileQueryDirective(
   context: CompilationContext,
-  directiveName: string,
+  directiveNode: DirectiveNode,
   prefix: string,
   fieldNode: FieldNode,
   returnType: GraphQLOutputType,
   path: ObjectPath
-): null | { argsName: string; body: string } {
-  if (fieldNode.directives == null) {
-    return null;
-  }
-
-  const directive = context.schema.getDirective(directiveName);
+): null | { argsName: string; body: string; name: string } {
+  const directive = context.schema.getDirective(directiveNode.name.value);
   if (directive == null) {
     throw new GraphQLError(
-      `Directive @${directiveName} is not defined`,
+      `Directive @${directiveNode.name.value} is not defined`,
       fieldNode
     );
-  }
-
-  const directiveNode = fieldNode.directives.find(
-    directive => directive.name.value === directiveName
-  );
-  if (directiveNode == null) {
-    return null;
   }
 
   const argsName = getArgumentsName(prefix);
@@ -1251,7 +1302,7 @@ function compileQueryDirective(
     path
   );
 
-  return { argsName, body };
+  return { argsName, body, name: directiveNode.name.value };
 }
 
 /**
